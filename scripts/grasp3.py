@@ -31,6 +31,7 @@ Keys
 """
 
 import argparse
+import collections
 import enum
 import os
 import select
@@ -56,11 +57,8 @@ from piper_sdk import C_PiperInterface_V2
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 from config import GraspConfig
-from utils import (
-    build_fk, fk_T_base_ee, read_joints_deg,
-    open_zed, sample_depth, backproject,
-    read_gripper_feedback,
-)
+from detector import DetectorThread
+from utils import build_fk, open_zed, read_gripper_feedback
 from ik_ee_ctrl import IKEndEffectorCtrl, CONTROL_DT
 
 
@@ -73,6 +71,8 @@ class State(enum.Enum):
     HEIGHT_DETECT = "height_detect"
     OPEN_GRIPPER  = "open_gripper"
     GRIP          = "grip"
+    PLACE         = "place"
+    RELEASE       = "release"
     DONE          = "done"
     ABORT         = "abort"
 
@@ -121,124 +121,15 @@ def rprint(msg: str):
     sys.stdout.flush()
 
 
-# ── Detection ─────────────────────────────────────────────────────────────────
-
-def detect_once(
-    cam, rgb_mat, depth_mat, runtime, K,
-    processor, det_model, device, text_prompt,
-    piper, fk_model, fk_data, fk_ee_id, T_ee_cam,
-    cfg: GraspConfig,
-    vis_win: str | None = None,
-) -> tuple[np.ndarray, float] | None:
-    if cam.grab(runtime) != sl.ERROR_CODE.SUCCESS:
-        return None
-    cam.retrieve_image(rgb_mat, sl.VIEW.LEFT)
-    cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
-    frame = np.ascontiguousarray(rgb_mat.get_data()[:, :, :3])
-    depth = depth_mat.get_data()
-
-    inputs = processor(images=frame, text=text_prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = det_model(**inputs)
-    results = processor.post_process_grounded_object_detection(
-        outputs, inputs.input_ids,
-        target_sizes=[(frame.shape[0], frame.shape[1])],
-    )[0]
-
-    mask   = results["scores"] >= cfg.min_conf
-    boxes  = results["boxes"][mask].cpu().numpy()
-    scores = results["scores"][mask].cpu().numpy()
-    labels = [results["text_labels"][i] for i, m in enumerate(mask) if m]
-
-    joints = read_joints_deg(piper)
-    T_be   = fk_T_base_ee(fk_model, fk_data, fk_ee_id, joints)
-
-    best_p, best_conf = None, 0.0
-    for box, score, label in zip(boxes, scores, labels):
-        x1, y1, x2, y2 = box
-        cx = (x1 + x2) / 2.0
-        # cy = y1 + (2.0 / 3.0) * (y2 - y1)
-        cy = (y1 + y2) / 2.0
-        d  = sample_depth(depth, cx, cy, cfg.depth_patch, cfg.depth_min_m, cfg.depth_max_m)
-        if d is None:
-            continue
-        d += cfg.depth_offset_m
-        p_cam  = backproject(cx, cy, d, K)
-        p_base = (T_be @ T_ee_cam @ np.append(p_cam, 1.0))[:3]
-        if score > best_conf:
-            best_conf = score
-            best_p    = p_base
-        if vis_win:
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(frame, f"{label} {score:.2f}", (int(x1), int(y1) - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    if vis_win:
-        annotated_frame = frame
-    else:
-        annotated_frame = None
-    return (best_p, best_conf, annotated_frame) if best_p is not None else (None, None, annotated_frame)
-
-
-class DetectorThread(threading.Thread):
-    """
-    Runs detect_once() in a loop; the latest result is readable at any time
-    via .latest (consuming — clears after read).
-    """
-
-    def __init__(self, cam, rgb_mat, depth_mat, runtime, K,
-                 processor, det_model, device, text_prompt,
-                 piper, fk_model, fk_data, fk_ee_id, T_ee_cam,
-                 cfg: GraspConfig, vis_win: str | None = None):
-        super().__init__(daemon=True)
-        self._detect_args = (
-            cam, rgb_mat, depth_mat, runtime, K,
-            processor, det_model, device, text_prompt,
-            piper, fk_model, fk_data, fk_ee_id, T_ee_cam,
-            cfg, vis_win,
-        )
-        self._lock        = threading.Lock()
-        self._latest      = None   # (p_base, conf) | None
-        self._latest_frame = None  # annotated BGR frame for vis (main-thread display)
-        self._running     = True
-
-    @property
-    def latest(self) -> tuple[np.ndarray, float] | None:
-        """Return and clear the latest detection result."""
-        with self._lock:
-            r, self._latest = self._latest, None
-            return r
-
-    @property
-    def latest_frame(self) -> "np.ndarray | None":
-        """Return (without clearing) the most recent annotated frame."""
-        with self._lock:
-            return self._latest_frame
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        while self._running:
-            result = detect_once(*self._detect_args)
-            if result is None:
-                continue
-            p, conf, frame = result
-            with self._lock:
-                if frame is not None:
-                    self._latest_frame = frame
-                if p is not None:
-                    self._latest = (p, conf)   # overwrite; consumer reads at its own pace
-
-
 # ── Arm motion helpers ────────────────────────────────────────────────────────
 
 
 def return_to_home(ctrl: IKEndEffectorCtrl, cfg: GraspConfig):
     print("Zeroing joint1…")
     ctrl.locked_joints = set()
-    j1_zero = [round(np.rad2deg(ctrl.q[i]) * 1000) for i in range(6)]
-    j1_zero[0] = 0
-    ctrl.go_to_joints(j1_zero)
+    # j1_zero = [round(np.rad2deg(ctrl.q[i]) * 1000) for i in range(6)]
+    # j1_zero[0] = 0
+    # ctrl.go_to_joints(j1_zero)
     print("Returning to intermediate…")
     ctrl.go_to_joints(list(cfg.intermediate_pose))
     print("Returning to zero…")
@@ -277,28 +168,46 @@ class GraspStateMachine:
         self._move_is_joints_only = False  # True = no Cartesian snap at end
 
         # Per-attempt data
-        self._hits            = []
         self._p_obj           = None
         self._yaw_iters       = 0
-        self._gripper_ready_t = 0.0
-        self._grip_cmd        = 0
-        self._grip_deadline   = 0.0
-        self._grip_last_t     = 0.0
-        self._grip_prev_angle = None   # angle at previous step command
+        self._detect_deadline = 0.0
+        # Sweep state
+        self._sweep_idx      = 0
+        self._sweep_base_pos = None
+        self._sweep_base_rot = None
+        self._sweep_deadline = 0.0
+        self._gripper_ready_t  = 0.0
+        self._grip_cmd         = 0
+        self._grip_deadline    = 0.0
+        self._grip_last_t      = 0.0
+        self._grip_prev_angle  = None   # angle at previous step command
+        self._gripper_open_cmd = self.ctrl.GRIPPER_OPEN_ANGLE
 
     def reset(self):
         """Prepare for a new pick attempt."""
         self.state   = State.SEARCH
         self.success = False
         self.ctrl.locked_joints = set()
-        self._hits         = []
+        self.detector.clear()
         self._p_obj        = None
         self._yaw_iters    = 0
+        self._detect_deadline = 0.0
+        # Capture the current arm pose as sweep base (arm is at search pose when reset() is called)
+        pin.forwardKinematics(self.ctrl.model, self.ctrl.data, self.ctrl.q)
+        pin.updateFramePlacements(self.ctrl.model, self.ctrl.data)
+        _T = self.ctrl.data.oMf[self.ctrl.ee_id]
+        self._sweep_base_pos     = _T.translation.copy()
+        self._sweep_base_rot     = _T.rotation.copy()
+        self.ctrl.target_pos     = _T.translation.copy()
+        self.ctrl.target_rot     = _T.rotation.copy()
+        self._sweep_idx          = 0
+        self._sweep_deadline     = time.time() + self.cfg.detect_timeout_s
         self._gripper_ready_t = 0.0
         self._grip_cmd     = 0
         self._grip_deadline  = 0.0
         self._grip_last_t    = 0.0
         self._grip_prev_angle = None
+        self._gripper_open_cmd = self.ctrl.GRIPPER_OPEN_ANGLE
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
@@ -310,6 +219,8 @@ class GraspStateMachine:
             State.HEIGHT_DETECT: self._height_detect,
             State.OPEN_GRIPPER:  self._open_gripper_wait,
             State.GRIP:          self._grip,
+            State.PLACE:         lambda: None,
+            State.RELEASE:       lambda: None,
         }.get(self.state, lambda: None)()
 
     # ── Motion primitives ─────────────────────────────────────────────────────
@@ -360,11 +271,6 @@ class GraspStateMachine:
         ]
         for i in range(6):
             self.ctrl.q[i] = np.deg2rad(joints_deg[i])
-        if self._step <= 3 or self._step % 10 == 0 or self._step == self._n_steps:
-            rprint(
-                f"[MOV] step={self._step}/{self._n_steps}  "
-                f"j1={joints_deg[0]:+.2f}°  joints_only={self._move_is_joints_only}"
-            )
         if self._step >= self._n_steps:
             if not self._move_is_joints_only:
                 self.ctrl.target_pos = self._end_pos.copy()
@@ -375,33 +281,48 @@ class GraspStateMachine:
     # ── Stage 1: Search ──────────────────────────────────────────────────────
 
     def _search(self) -> None:
+        n = self.detector.queue_size
         result = self.detector.latest
         if result is not None:
             p, conf = result
-            self._hits.append(p)
             sys.stdout.write(
-                f"\r[S1] {len(self._hits)}/{self.cfg.detection_frames}  "
+                f"\r[S1] {n}/{self.cfg.detection_window}  "
                 f"conf={conf:.2f}  "
                 f"X={p[0]*100:+.1f} Y={p[1]*100:+.1f} Z={p[2]*100:+.1f} cm   "
             )
             sys.stdout.flush()
-            if len(self._hits) >= self.cfg.detection_frames:
-                self._p_obj = np.median(np.array(self._hits), axis=0)
-                self._hits.clear()
-                dist = float(np.linalg.norm(self._p_obj))
-                if dist > self.cfg.max_reach_m:
-                    rprint(f"\n[S1] too far ({dist*100:.1f} cm) — keep looking")
-                    return None
-                rprint(
-                    f"\n[S1] locked  "
-                    f"X={self._p_obj[0]*100:+.2f} "
-                    f"Y={self._p_obj[1]*100:+.2f} "
-                    f"Z={self._p_obj[2]*100:+.2f} cm"
-                )
-                self._yaw_iters = 0
-                self._begin_yaw()
+            dist = float(np.linalg.norm(p))
+            if dist > self.cfg.max_reach_m:
+                rprint(f"\n[S1] too far ({dist*100:.1f} cm) — keep looking")
+                return None
+            self._p_obj = p
+            rprint(
+                f"\n[S1] locked  "
+                f"X={p[0]*100:+.2f} "
+                f"Y={p[1]*100:+.2f} "
+                f"Z={p[2]*100:+.2f} cm"
+            )
+            self._yaw_iters = 0
+            self._begin_yaw()
+        elif time.time() > self._sweep_deadline:
+            # No detection at current position — try next sweep offset.
+            self._sweep_idx = (self._sweep_idx + 1) % len(self.cfg.sweep_offsets_m)
+            offset = np.array(self.cfg.sweep_offsets_m[self._sweep_idx])
+            sweep_pos = self._sweep_base_pos + offset
+            rprint(
+                f"\n[S1] no detection — sweep {self._sweep_idx}  "
+                f"({offset[0]*100:+.1f}, {offset[1]*100:+.1f}, {offset[2]*100:+.1f}) cm"
+            )
+            def _after_sweep():
+                self.detector.clear()
+                self._sweep_deadline = time.time() + self.cfg.detect_timeout_s
+                self.state = State.SEARCH
+            self._begin_move(sweep_pos, self._sweep_base_rot, 1.5, _after_sweep)
         else:
-            sys.stdout.write(f"\r[S1] {len(self._hits)} hits so far, waiting…   ")
+            remaining = self._sweep_deadline - time.time()
+            sys.stdout.write(
+                f"\r[S1] {n}/{self.detector.min_count} (need {self.detector.min_count}) waiting… ({remaining:.0f}s)   "
+            )
             sys.stdout.flush()
         return None
 
@@ -420,7 +341,7 @@ class GraspStateMachine:
         if yaw_err <= self.cfg.yaw_threshold_deg or self._yaw_iters >= self.cfg.yaw_max_iters:
             rprint("[S2] aligned — locking joint1")
             self.ctrl.locked_joints = {0}
-            self._misses = 0
+            self._detect_deadline = time.time() + self.cfg.detect_timeout_s
             self.state   = State.HEIGHT_DETECT
             return
 
@@ -442,8 +363,8 @@ class GraspStateMachine:
             T = self.ctrl.data.oMf[self.ctrl.ee_id]
             self.ctrl.target_pos = T.translation.copy()
             self.ctrl.target_rot = T.rotation.copy()
-            self._misses         = 0
-            self._hits.clear()
+            self.detector.clear()
+            self._detect_deadline = time.time() + self.cfg.detect_timeout_s
             self.state = State.YAW_DETECT
 
         self._begin_move_joints(target_q_deg, duration, _after)
@@ -451,21 +372,19 @@ class GraspStateMachine:
     def _yaw_detect(self) -> None:
         result = self.detector.latest
         if result is not None:
-            self._p_obj  = result[0]
-            self._misses = 0
+            self._p_obj = result[0]
             self._begin_yaw()
         else:
-            self._misses += 1
+            remaining = self._detect_deadline - time.time()
             sys.stdout.write(
-                f"\r[S2] waiting for re-detection (miss {self._misses})   "
+                f"\r[S2] waiting for re-detection ({remaining:.1f}s left)   "
             )
             sys.stdout.flush()
-            if self._misses > 30:
+            if time.time() > self._detect_deadline:
                 rprint("\n[S2] object lost — restarting search")
                 self.ctrl.locked_joints = set()
-                self._yaw_iters         = 0
-                self._misses            = 0
-                self._hits.clear()
+                self._yaw_iters = 0
+                self.detector.clear()
                 self.state = State.SEARCH
         return None
 
@@ -474,8 +393,7 @@ class GraspStateMachine:
     def _height_detect(self) -> None:
         result = self.detector.latest
         if result is not None:
-            self._p_obj  = result[0]
-            self._misses = 0
+            self._p_obj = result[0]
 
             tgt_rot     = approach_rotation(self.ctrl.q[0])
             z_err       = self._p_obj[2] - self.ctrl.target_pos[2]
@@ -501,44 +419,62 @@ class GraspStateMachine:
             duration = float(np.clip(abs(z_err) * 50.0, 0.5, 3.0))
 
             def _after():
-                self._misses = 0
+                self._detect_deadline = time.time() + self.cfg.detect_timeout_s
                 self.state   = State.HEIGHT_DETECT
 
             self._begin_move(end_pos, tgt_rot, duration, _after)
         else:
-            self._misses += 1
+            remaining = self._detect_deadline - time.time()
             sys.stdout.write(
-                f"\r[S3] no detection (miss {self._misses})   "
+                f"\r[S3] no detection ({remaining:.1f}s left)   "
             )
             sys.stdout.flush()
-            if self._misses > 30:
+            if time.time() > self._detect_deadline:
                 rprint("\n[S3] object lost — restarting search")
                 self.ctrl.locked_joints = set()
-                self._yaw_iters         = 0
-                self._misses            = 0
-                self._hits.clear()
+                self._yaw_iters = 0
+                self.detector.clear()
                 self.state = State.SEARCH
         return None
 
     # ── Stage 4: Approach ────────────────────────────────────────────────────
 
     def _launch_approach(self):
-        self.ctrl.piper.GripperCtrl(
-            self.ctrl.GRIPPER_OPEN_ANGLE, self.ctrl.GRIPPER_EFFORT, 0x01, 0)
+        fb = read_gripper_feedback(self.ctrl.piper)
+        self._gripper_open_cmd  = fb["angle_raw"]   # start from current position
+        self._gripper_ready_t   = 0.0               # start stepping immediately
         self.ctrl._gripper_open = True
-        self._gripper_ready_t   = time.time() + 0.5
         self.state              = State.OPEN_GRIPPER
 
     def _open_gripper_wait(self) -> None:
-        if time.time() < self._gripper_ready_t:
+        now = time.time()
+        if now < self._gripper_ready_t:
             return None
 
+        # Step the gripper open incrementally until fully open.
+        if self._gripper_open_cmd < self.ctrl.GRIPPER_OPEN_ANGLE:
+            self._gripper_open_cmd = min(
+                self.ctrl.GRIPPER_OPEN_ANGLE,
+                self._gripper_open_cmd + self.cfg.gripper_open_step_raw,
+            )
+            self.ctrl.piper.GripperCtrl(
+                self._gripper_open_cmd, self.ctrl.GRIPPER_EFFORT, 0x01, 0)
+            self._gripper_ready_t = now + self._GRIP_SETTLE
+            return None
         # Rotation is already what Stage 3 converged to — keep it exactly.
         tgt_rot    = self.ctrl.target_rot.copy()
         tcp_offset = self.ctrl.get_tcp_offset_base()
         tcp_mag    = np.linalg.norm(tcp_offset)
+
+        # Approach direction: XY unit vector pointing from base toward object.
+        obj_xy     = np.array([self._p_obj[0], self._p_obj[1], 0.0])
+        obj_xy_mag = np.linalg.norm(obj_xy)
+        approach_dir = obj_xy / obj_xy_mag if obj_xy_mag > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+        # Pull back by pregrasp_offset so the TCP stops just before the object.
         grasp_tcp  = np.array([self._p_obj[0], self._p_obj[1],
-                                self.ctrl.target_pos[2]])
+                                self.ctrl.target_pos[2]]) \
+                     - approach_dir * self.cfg.pregrasp_offset_m
         grasp_pos  = grasp_tcp - tcp_offset
 
         rprint(
@@ -599,10 +535,17 @@ class GraspStateMachine:
 
             if stalled:
                 rprint(
-                    f"[GRIP] grasped!  "
+                    f"[GRIP] contact!  "
                     f"angle={fb['angle_mm']:.1f} mm  "
-                    f"effort={fb['effort_nm']:+.2f} N·m"
+                    f"effort={fb['effort_nm']:+.2f} N·m  — squeezing"
                 )
+                squeeze_cmd = max(
+                    self.cfg.gripper_min_hold_angle_raw,
+                    self._grip_cmd - self.cfg.gripper_squeeze_extra_raw,
+                )
+                self.ctrl.piper.GripperCtrl(
+                    squeeze_cmd, self.ctrl.GRIPPER_EFFORT, 0x01, 0)
+                time.sleep(self._GRIP_SETTLE * 3)   # hold squeeze briefly
                 self.ctrl._gripper_open = False
                 lift_pos = self.ctrl.target_pos + np.array([0.0, 0.0, self.cfg.lift_height_m])
                 self._begin_move(lift_pos, self.ctrl.target_rot.copy(), 2.0, self._after_lift)
@@ -628,10 +571,28 @@ class GraspStateMachine:
         return None   # no joint motion during grip
 
     def _after_lift(self):
-        rprint("[S4] lift complete")
+        rprint("[LIFT] complete — moving to intermediate")
         self.ctrl.locked_joints = set()
-        self.success = True
-        self.state   = State.DONE
+        self.state = State.PLACE
+
+        def _after_place():
+            rprint("[PLACE] at place pose — releasing object")
+            self.state = State.RELEASE
+            self.ctrl.piper.GripperCtrl(
+                self.ctrl.GRIPPER_OPEN_ANGLE, self.ctrl.GRIPPER_EFFORT, 0x01, 0)
+            self.ctrl._gripper_open = True
+            time.sleep(0.5)
+            self.success = True
+            self.state   = State.DONE
+
+        def _after_intermediate():
+            rprint("[PLACE] at intermediate — moving to place pose")
+            self.state = State.PLACE
+            place_deg = [v / 1000.0 for v in self.cfg.place_pose]
+            self._begin_move_joints(place_deg, 3.0, _after_place)
+
+        intermediate_deg = [v / 1000.0 for v in self.cfg.intermediate_pose]
+        self._begin_move_joints(intermediate_deg, 2.0, _after_intermediate)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -718,6 +679,17 @@ def main():
         while True:
             if not wait_for_space():
                 break
+
+            # Reload config from disk so edits to config.py take effect immediately.
+            import importlib
+            import config as _config_module
+            importlib.reload(_config_module)
+            cfg = _config_module.GraspConfig()
+            machine.cfg = cfg
+            detector.cfg = cfg
+            detector._queue     = collections.deque(maxlen=cfg.detection_window)
+            detector._min_count = cfg.detection_frames
+            print("Config reloaded.")
 
             print("\nMoving to search pose…")
             ctrl.go_to_joints(list(cfg.search_pose))

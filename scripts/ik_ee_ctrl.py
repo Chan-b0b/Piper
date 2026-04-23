@@ -102,7 +102,7 @@ class IKEndEffectorCtrl:
         # ── Workspace position barrier (PositionBarrier on EE_FRAME) ────────
         # Bounds in metres; z has no upper limit so use a large sentinel.
         self._pos_min = pos_min_m if pos_min_m is not None else np.array([ 0.100, -0.200,  0.200])
-        self._pos_max = pos_max_m if pos_max_m is not None else np.array([ 0.600,  0.200, 10.000])
+        self._pos_max = pos_max_m if pos_max_m is not None else np.array([ 0.700,  0.200, 10.000])
         _p_min = self._pos_min
         _p_max = self._pos_max
         self.pos_barrier_f1 = PositionBarrier(
